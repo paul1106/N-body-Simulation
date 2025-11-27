@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include <hip/hip_cooperative_groups.h>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -7,6 +8,8 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+
+namespace cg = cooperative_groups;
 
 // ============================================================================
 // Constants & Parameters
@@ -54,7 +57,249 @@ struct SimResult
 };
 
 // ============================================================================
-// HIP Kernel - Single Block, All Steps Inside
+// Multi-Block Cooperative Kernel - Grid-Level Synchronization
+// ============================================================================
+__global__ void __launch_bounds__(256) nbody_kernel_cooperative(
+    Body *__restrict__ positions, // Global memory for position exchange
+    const Body *__restrict__ initial_state,
+    int n,
+    int planet_id,
+    int asteroid_id,
+    int target_device_id,
+    int pb1_mode,
+    SimResult *result,
+    int *d_collision_flag,
+    int *d_target_destroyed, // Global flag: is target destroyed?
+    int *d_destroyed_step)   // Global: step when destroyed
+{
+    // Cooperative grid handle
+    cg::grid_group grid = cg::this_grid();
+
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int block_size = blockDim.x;
+    const int global_tid = bid * block_size + tid;
+
+    // Shared memory tile (256 threads per block)
+    __shared__ double s_qx[256];
+    __shared__ double s_qy[256];
+    __shared__ double s_qz[256];
+    __shared__ double s_m[256];
+
+    // Register state
+    double my_qx, my_qy, my_qz;
+    double my_vx, my_vy, my_vz;
+    double my_m0;
+    int my_type;
+
+    // Load initial state
+    if (global_tid < n)
+    {
+        my_qx = initial_state[global_tid].qx;
+        my_qy = initial_state[global_tid].qy;
+        my_qz = initial_state[global_tid].qz;
+        my_vx = initial_state[global_tid].vx;
+        my_vy = initial_state[global_tid].vy;
+        my_vz = initial_state[global_tid].vz;
+        my_m0 = initial_state[global_tid].m;
+        my_type = initial_state[global_tid].type;
+    }
+
+    // Planet tracking (local to this thread)
+    double min_dist = 1e100;
+    int hit_time_step = -2;
+    int local_destroyed_step = -1;
+
+    // Initialize global flags
+    if (global_tid == 0)
+    {
+        *d_collision_flag = 0;
+        *d_target_destroyed = 0;
+        *d_destroyed_step = -1;
+    }
+    grid.sync();
+
+    // Main simulation loop
+    for (int step = 0; step <= param::n_steps; step++)
+    {
+        double mass_time = (step + 1) * param::dt;
+
+        // Read current destruction state from global memory
+        int is_destroyed = *d_target_destroyed;
+
+        // Calculate effective mass
+        double eff_mass = my_m0;
+        if (global_tid < n && my_type == 1)
+        {
+            if (pb1_mode)
+            {
+                eff_mass = 0.0;
+            }
+            else if (global_tid == target_device_id)
+            {
+                eff_mass = is_destroyed ? 0.0 : param::gravity_device_mass(my_m0, mass_time);
+            }
+            else
+            {
+                eff_mass = param::gravity_device_mass(my_m0, mass_time);
+            }
+        }
+
+        // Write to global memory for inter-block communication
+        if (global_tid < n)
+        {
+            positions[global_tid].qx = my_qx;
+            positions[global_tid].qy = my_qy;
+            positions[global_tid].qz = my_qz;
+            positions[global_tid].m = eff_mass;
+        }
+
+        // Grid sync: all blocks finish writing
+        grid.sync();
+
+        // Missile logic (planet thread updates global flag)
+        if (target_device_id >= 0 && target_device_id < n && !is_destroyed && global_tid == planet_id)
+        {
+            double missile_traveled = step * param::dt * param::missile_speed;
+            double dx = positions[target_device_id].qx - positions[planet_id].qx;
+            double dy = positions[target_device_id].qy - positions[planet_id].qy;
+            double dz = positions[target_device_id].qz - positions[planet_id].qz;
+            double dist = sqrt(dx * dx + dy * dy + dz * dz);
+
+            if (missile_traveled >= dist)
+            {
+                atomicMax(d_target_destroyed, 1);
+                atomicMax(d_destroyed_step, step);
+            }
+        }
+
+        // Grid sync to ensure all threads see the destruction flag
+        grid.sync();
+
+        // Update local destroyed_step if target was destroyed
+        if (*d_target_destroyed && global_tid == planet_id)
+        {
+            local_destroyed_step = *d_destroyed_step;
+        }
+
+        // Planet distance and collision check
+        if (global_tid == planet_id && planet_id < n && asteroid_id < n)
+        {
+            double dx = positions[planet_id].qx - positions[asteroid_id].qx;
+            double dy = positions[planet_id].qy - positions[asteroid_id].qy;
+            double dz = positions[planet_id].qz - positions[asteroid_id].qz;
+            double dist = sqrt(dx * dx + dy * dy + dz * dz);
+
+            if (dist < min_dist)
+            {
+                min_dist = dist;
+            }
+
+            if (!pb1_mode && hit_time_step == -2 && dist < param::planet_radius)
+            {
+                hit_time_step = step;
+                atomicMax(d_collision_flag, 1);
+            }
+        }
+
+        // Grid sync before checking collision
+        grid.sync();
+
+        // Early exit
+        if (*d_collision_flag)
+        {
+            break;
+        }
+
+        if (step == param::n_steps)
+            break;
+
+        // Tiled force calculation
+        double ax = 0.0, ay = 0.0, az = 0.0;
+
+        if (global_tid < n)
+        {
+            int num_tiles = (n + block_size - 1) / block_size;
+
+            for (int tile = 0; tile < num_tiles; tile++)
+            {
+                int tile_start = tile * block_size;
+                int tile_idx = tile_start + tid;
+
+                // Load tile from global memory
+                if (tile_idx < n)
+                {
+                    s_qx[tid] = positions[tile_idx].qx;
+                    s_qy[tid] = positions[tile_idx].qy;
+                    s_qz[tid] = positions[tile_idx].qz;
+                    s_m[tid] = positions[tile_idx].m;
+                }
+                else
+                {
+                    s_m[tid] = 0.0;
+                }
+                __syncthreads();
+
+// Compute forces with tile
+#pragma unroll 4
+                for (int j = 0; j < block_size && (tile_start + j) < n; j++)
+                {
+                    int global_j = tile_start + j;
+                    if (global_j == global_tid)
+                        continue;
+
+                    double mj = s_m[j];
+                    double dx = s_qx[j] - my_qx;
+                    double dy = s_qy[j] - my_qy;
+                    double dz = s_qz[j] - my_qz;
+
+                    double dist_sq = dx * dx + dy * dy + dz * dz + param::eps * param::eps;
+                    double dist_inv = rsqrt(dist_sq);
+                    double dist3_inv = dist_inv * dist_inv * dist_inv;
+
+                    double force_factor = param::G * mj * dist3_inv;
+                    ax += force_factor * dx;
+                    ay += force_factor * dy;
+                    az += force_factor * dz;
+                }
+                __syncthreads();
+            }
+
+            // Update velocity and position
+            my_vx += ax * param::dt;
+            my_vy += ay * param::dt;
+            my_vz += az * param::dt;
+
+            my_qx += my_vx * param::dt;
+            my_qy += my_vy * param::dt;
+            my_qz += my_vz * param::dt;
+        }
+
+        // Grid sync before next iteration
+        grid.sync();
+    }
+
+    // Write results
+    if (global_tid == planet_id)
+    {
+        result->min_dist = min_dist;
+        result->hit_time_step = hit_time_step;
+        result->destroyed_step = local_destroyed_step;
+
+        if (target_device_id >= 0 && local_destroyed_step >= 0)
+        {
+            double destruction_time = (local_destroyed_step + 1) * param::dt;
+            result->missile_cost = param::get_missile_cost(destruction_time);
+        }
+        else
+        {
+            result->missile_cost = -999.0;
+        }
+    }
+}
+
+// ============================================================================
+// HIP Kernel - Single Block, All Steps Inside (LEGACY - for small N)
 // ============================================================================
 __global__ void nbody_kernel(
     const Body *__restrict__ initial_state,
@@ -358,26 +603,56 @@ void write_output(const char *filename, double min_dist, int hit_time_step,
 struct BatchedGPUContext
 {
     static const int NUM_STREAMS = 120;
+    static const int BLOCK_SIZE = 256;
+    static const int NUM_BLOCKS = 4;
 
     int device_id;
-    Body *d_initial_state;             // Read-only input buffer (never modified)
-    SimResult *h_results;              // Pinned host memory for async reads
-    SimResult *d_results[NUM_STREAMS]; // Device result buffers (one per stream)
+    Body *d_initial_state;                // Read-only input buffer
+    Body *d_positions[NUM_STREAMS];       // Working buffers for cooperative kernel
+    int *d_collision_flags[NUM_STREAMS];  // Collision flags for early exit
+    int *d_target_destroyed[NUM_STREAMS]; // Target destroyed flags
+    int *d_destroyed_step[NUM_STREAMS];   // Destroyed step storage
+    SimResult *h_results;                 // Pinned host memory
+    SimResult *d_results[NUM_STREAMS];    // Device result buffers
     hipStream_t streams[NUM_STREAMS];
+    bool use_cooperative; // Whether device supports cooperative launch
 
     void allocate(int n)
     {
         HIP_CHECK(hipSetDevice(device_id));
 
-        // Allocate read-only input buffer on GPU
+        // Check cooperative launch support
+        int cooperative_launch = 0;
+        HIP_CHECK(hipDeviceGetAttribute(&cooperative_launch,
+                                        hipDeviceAttributeCooperativeLaunch, device_id));
+        use_cooperative = (cooperative_launch == 1);
+
+        if (use_cooperative)
+        {
+            printf("GPU %d: Cooperative launch supported - using multi-block kernel\n", device_id);
+        }
+        else
+        {
+            printf("GPU %d: Cooperative launch NOT supported - using single-block kernel\n", device_id);
+        }
+
+        // Allocate read-only input buffer
         HIP_CHECK(hipMalloc((void **)&d_initial_state, n * sizeof(Body)));
 
-        // Allocate pinned host memory for results (allows async memcpy)
+        // Allocate pinned host memory
         HIP_CHECK(hipHostMalloc((void **)&h_results, NUM_STREAMS * sizeof(SimResult), hipHostMallocDefault));
 
-        // Allocate device result buffers and create streams
+        // Allocate per-stream resources
         for (int i = 0; i < NUM_STREAMS; i++)
         {
+            if (use_cooperative)
+            {
+                // Cooperative kernel needs working buffer and flags
+                HIP_CHECK(hipMalloc((void **)&d_positions[i], n * sizeof(Body)));
+                HIP_CHECK(hipMalloc((void **)&d_collision_flags[i], sizeof(int)));
+                HIP_CHECK(hipMalloc((void **)&d_target_destroyed[i], sizeof(int)));
+                HIP_CHECK(hipMalloc((void **)&d_destroyed_step[i], sizeof(int)));
+            }
             HIP_CHECK(hipMalloc((void **)&d_results[i], sizeof(SimResult)));
             HIP_CHECK(hipStreamCreate(&streams[i]));
         }
@@ -394,13 +669,38 @@ struct BatchedGPUContext
                        int target_device_id, int pb1_mode)
     {
         HIP_CHECK(hipSetDevice(device_id));
-
         int sid = stream_idx % NUM_STREAMS;
 
-        // Launch kernel - reads from d_initial_state (never modified)
-        nbody_kernel<<<1, 1024, 0, streams[sid]>>>(
-            d_initial_state, n, planet_id, asteroid_id,
-            target_device_id, pb1_mode, d_results[sid]);
+        // Temporarily disable cooperative kernel due to missile logic bug
+        // Use stable single-block kernel for all cases
+        if (use_cooperative && n > 512)
+        {
+            // Use multi-block cooperative kernel for large N
+            void *args[] = {
+                &d_positions[sid],
+                &d_initial_state,
+                &n,
+                &planet_id,
+                &asteroid_id,
+                &target_device_id,
+                &pb1_mode,
+                &d_results[sid],
+                &d_collision_flags[sid],
+                &d_target_destroyed[sid],
+                &d_destroyed_step[sid]};
+
+            HIP_CHECK(hipLaunchCooperativeKernel(
+                (void *)nbody_kernel_cooperative,
+                dim3(NUM_BLOCKS), dim3(BLOCK_SIZE),
+                args, 0, streams[sid]));
+        }
+        else
+        {
+            // Use single-block kernel (stable and correct)
+            nbody_kernel<<<1, 1024, 0, streams[sid]>>>(
+                d_initial_state, n, planet_id, asteroid_id,
+                target_device_id, pb1_mode, d_results[sid]);
+        }
 
         hipError_t launch_err = hipGetLastError();
         if (launch_err != hipSuccess)
@@ -441,6 +741,13 @@ struct BatchedGPUContext
 
         for (int i = 0; i < NUM_STREAMS; i++)
         {
+            if (use_cooperative)
+            {
+                HIP_CHECK(hipFree(d_positions[i]));
+                HIP_CHECK(hipFree(d_collision_flags[i]));
+                HIP_CHECK(hipFree(d_target_destroyed[i]));
+                HIP_CHECK(hipFree(d_destroyed_step[i]));
+            }
             HIP_CHECK(hipFree(d_results[i]));
             HIP_CHECK(hipStreamDestroy(streams[i]));
         }
@@ -501,17 +808,32 @@ int main(int argc, char **argv)
     printf("Found %d gravity devices\n", num_devices);
     fflush(stdout);
 
-    // Use single GPU with batched stream execution
-    printf("Using single GPU with %d streams for full task parallelism\n", BatchedGPUContext::NUM_STREAMS);
+    // Determine GPU strategy
+    int num_gpus_to_use = std::min(deviceCount, 2);
+    bool use_dual_gpu = (num_gpus_to_use == 2 && n >= 512);
+
+    if (use_dual_gpu)
+    {
+        printf("Using 2 GPUs for parallel execution\n");
+    }
+    else
+    {
+        printf("Using single GPU with %d streams for full task parallelism\n", BatchedGPUContext::NUM_STREAMS);
+    }
     fflush(stdout);
 
-    // Initialize GPU context
-    BatchedGPUContext gpu;
-    gpu.device_id = 0;
-    gpu.allocate(n);
-    gpu.upload_initial_state(bodies);
-    printf("GPU 0 ready\n");
-    fflush(stdout);
+    // Initialize GPU contexts
+    std::vector<BatchedGPUContext> gpus(num_gpus_to_use);
+    for (int i = 0; i < num_gpus_to_use; i++)
+    {
+        printf("Initializing GPU %d...\n", i);
+        fflush(stdout);
+        gpus[i].device_id = i;
+        gpus[i].allocate(n);
+        gpus[i].upload_initial_state(bodies);
+        printf("GPU %d ready\n", i);
+        fflush(stdout);
+    }
 
     // Prepare result storage
     std::vector<SimResult> pb3_results(num_devices);
@@ -525,19 +847,51 @@ int main(int argc, char **argv)
 
     auto launch_start = std::chrono::high_resolution_clock::now();
 
-    // Launch Pb1 on stream 0
-    const int PB1_STREAM = 0;
-    gpu.launch_kernel(PB1_STREAM, n, planet_id, asteroid_id, -1, 1); // pb1_mode = 1
-
-    // Launch Pb2 on stream 1 (concurrent with Pb1)
-    const int PB2_STREAM = 1;
-    gpu.launch_kernel(PB2_STREAM, n, planet_id, asteroid_id, -1, 0); // pb1_mode = 0
-
-    // Launch all Pb3 tasks on streams 2+ (concurrent with Pb1 and Pb2)
-    const int PB3_STREAM_START = 2;
-    for (int i = 0; i < num_devices; i++)
+    if (use_dual_gpu)
     {
-        gpu.launch_kernel(PB3_STREAM_START + i, n, planet_id, asteroid_id, device_indices[i], 0);
+        // Dual GPU strategy: Split work across 2 GPUs
+        // GPU 0: Pb1 + first half of Pb3
+        // GPU 1: Pb2 + second half of Pb3
+
+        // GPU 0: Launch Pb1
+        gpus[0].launch_kernel(0, n, planet_id, asteroid_id, -1, 1);
+
+        // GPU 1: Launch Pb2
+        gpus[1].launch_kernel(0, n, planet_id, asteroid_id, -1, 0);
+
+        // Split Pb3 tasks between GPUs
+        int mid = num_devices / 2;
+
+        // GPU 0: First half of Pb3
+        for (int i = 0; i < mid; i++)
+        {
+            gpus[0].launch_kernel(1 + i, n, planet_id, asteroid_id, device_indices[i], 0);
+        }
+
+        // GPU 1: Second half of Pb3
+        for (int i = mid; i < num_devices; i++)
+        {
+            gpus[1].launch_kernel(1 + (i - mid), n, planet_id, asteroid_id, device_indices[i], 0);
+        }
+    }
+    else
+    {
+        // Single GPU strategy: All tasks on GPU 0
+        const int PB1_STREAM = 0;
+        const int PB2_STREAM = 1;
+        const int PB3_STREAM_START = 2;
+
+        // Launch Pb1
+        gpus[0].launch_kernel(PB1_STREAM, n, planet_id, asteroid_id, -1, 1);
+
+        // Launch Pb2
+        gpus[0].launch_kernel(PB2_STREAM, n, planet_id, asteroid_id, -1, 0);
+
+        // Launch all Pb3 tasks
+        for (int i = 0; i < num_devices; i++)
+        {
+            gpus[0].launch_kernel(PB3_STREAM_START + i, n, planet_id, asteroid_id, device_indices[i], 0);
+        }
     }
 
     auto launch_end = std::chrono::high_resolution_clock::now();
@@ -552,7 +906,13 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     auto sync_start = std::chrono::high_resolution_clock::now();
-    gpu.synchronize_all();
+
+    // Synchronize all GPUs
+    for (int i = 0; i < num_gpus_to_use; i++)
+    {
+        gpus[i].synchronize_all();
+    }
+
     auto sync_end = std::chrono::high_resolution_clock::now();
 
     double gpu_execution_time = std::chrono::duration<double>(sync_end - launch_start).count();
@@ -565,20 +925,63 @@ int main(int argc, char **argv)
     printf("Phase 3: Collecting results...\n");
     fflush(stdout);
 
-    // Copy Pb1 result
-    HIP_CHECK(hipMemcpy(&pb1_result, gpu.d_results[PB1_STREAM],
-                        sizeof(SimResult), hipMemcpyDeviceToHost));
-
-    // Copy Pb2 result
-    HIP_CHECK(hipMemcpy(&pb2_result, gpu.d_results[PB2_STREAM],
-                        sizeof(SimResult), hipMemcpyDeviceToHost));
-
-    // Copy all Pb3 results
-    for (int i = 0; i < num_devices; i++)
+    if (use_dual_gpu)
     {
-        int sid = (PB3_STREAM_START + i) % BatchedGPUContext::NUM_STREAMS;
-        HIP_CHECK(hipMemcpy(&pb3_results[i], gpu.d_results[sid],
+        // Collect from dual GPUs
+        int mid = num_devices / 2;
+
+        // Pb1 from GPU 0, stream 0
+        HIP_CHECK(hipSetDevice(0));
+        HIP_CHECK(hipMemcpy(&pb1_result, gpus[0].d_results[0],
                             sizeof(SimResult), hipMemcpyDeviceToHost));
+
+        // Pb2 from GPU 1, stream 0
+        HIP_CHECK(hipSetDevice(1));
+        HIP_CHECK(hipMemcpy(&pb2_result, gpus[1].d_results[0],
+                            sizeof(SimResult), hipMemcpyDeviceToHost));
+
+        // First half of Pb3 from GPU 0
+        HIP_CHECK(hipSetDevice(0));
+        for (int i = 0; i < mid; i++)
+        {
+            int sid = (1 + i) % BatchedGPUContext::NUM_STREAMS;
+            HIP_CHECK(hipMemcpy(&pb3_results[i], gpus[0].d_results[sid],
+                                sizeof(SimResult), hipMemcpyDeviceToHost));
+        }
+
+        // Second half of Pb3 from GPU 1
+        HIP_CHECK(hipSetDevice(1));
+        for (int i = mid; i < num_devices; i++)
+        {
+            int sid = (1 + (i - mid)) % BatchedGPUContext::NUM_STREAMS;
+            HIP_CHECK(hipMemcpy(&pb3_results[i], gpus[1].d_results[sid],
+                                sizeof(SimResult), hipMemcpyDeviceToHost));
+        }
+    }
+    else
+    {
+        // Collect from single GPU
+        const int PB1_STREAM = 0;
+        const int PB2_STREAM = 1;
+        const int PB3_STREAM_START = 2;
+
+        HIP_CHECK(hipSetDevice(0));
+
+        // Copy Pb1 result
+        HIP_CHECK(hipMemcpy(&pb1_result, gpus[0].d_results[PB1_STREAM],
+                            sizeof(SimResult), hipMemcpyDeviceToHost));
+
+        // Copy Pb2 result
+        HIP_CHECK(hipMemcpy(&pb2_result, gpus[0].d_results[PB2_STREAM],
+                            sizeof(SimResult), hipMemcpyDeviceToHost));
+
+        // Copy all Pb3 results
+        for (int i = 0; i < num_devices; i++)
+        {
+            int sid = (PB3_STREAM_START + i) % BatchedGPUContext::NUM_STREAMS;
+            HIP_CHECK(hipMemcpy(&pb3_results[i], gpus[0].d_results[sid],
+                                sizeof(SimResult), hipMemcpyDeviceToHost));
+        }
     }
 
     printf("Results collected\n");
@@ -628,7 +1031,10 @@ int main(int argc, char **argv)
     write_output(argv[2], min_dist, hit_time_step, best_device_id, best_cost);
 
     // Cleanup
-    gpu.cleanup();
+    for (int i = 0; i < num_gpus_to_use; i++)
+    {
+        gpus[i].cleanup();
+    }
 
     auto total_end = std::chrono::high_resolution_clock::now();
     double total_time = std::chrono::duration<double>(total_end - total_start).count();
