@@ -60,7 +60,7 @@ struct SimResult
 // Multi-Block Cooperative Kernel - Grid-Level Synchronization
 // ============================================================================
 __global__ void __launch_bounds__(256) nbody_kernel_cooperative(
-    Body *__restrict__ positions, // Global memory for position exchange
+    double4 *__restrict__ public_data, // Global memory for position exchange
     const Body *__restrict__ initial_state,
     int n,
     int planet_id,
@@ -148,10 +148,7 @@ __global__ void __launch_bounds__(256) nbody_kernel_cooperative(
         // Write to global memory for inter-block communication
         if (global_tid < n)
         {
-            positions[global_tid].qx = my_qx;
-            positions[global_tid].qy = my_qy;
-            positions[global_tid].qz = my_qz;
-            positions[global_tid].m = eff_mass;
+            public_data[global_tid] = make_double4(my_qx, my_qy, my_qz, eff_mass);
         }
 
         // Grid sync: all blocks finish writing
@@ -161,9 +158,9 @@ __global__ void __launch_bounds__(256) nbody_kernel_cooperative(
         if (target_device_id >= 0 && target_device_id < n && !is_destroyed && global_tid == planet_id)
         {
             double missile_traveled = step * param::dt * param::missile_speed;
-            double dx = positions[target_device_id].qx - positions[planet_id].qx;
-            double dy = positions[target_device_id].qy - positions[planet_id].qy;
-            double dz = positions[target_device_id].qz - positions[planet_id].qz;
+            double dx = public_data[target_device_id].x - public_data[planet_id].x;
+            double dy = public_data[target_device_id].y - public_data[planet_id].y;
+            double dz = public_data[target_device_id].z - public_data[planet_id].z;
             double dist = sqrt(dx * dx + dy * dy + dz * dz);
 
             if (missile_traveled >= dist)
@@ -185,9 +182,9 @@ __global__ void __launch_bounds__(256) nbody_kernel_cooperative(
         // Planet distance and collision check
         if (global_tid == planet_id && planet_id < n && asteroid_id < n)
         {
-            double dx = positions[planet_id].qx - positions[asteroid_id].qx;
-            double dy = positions[planet_id].qy - positions[asteroid_id].qy;
-            double dz = positions[planet_id].qz - positions[asteroid_id].qz;
+            double dx = public_data[planet_id].x - public_data[asteroid_id].x;
+            double dy = public_data[planet_id].y - public_data[asteroid_id].y;
+            double dz = public_data[planet_id].z - public_data[asteroid_id].z;
             double dist = sqrt(dx * dx + dy * dy + dz * dz);
 
             if (dist < min_dist)
@@ -229,13 +226,17 @@ __global__ void __launch_bounds__(256) nbody_kernel_cooperative(
                 // Load tile from global memory
                 if (tile_idx < n)
                 {
-                    s_qx[tid] = positions[tile_idx].qx;
-                    s_qy[tid] = positions[tile_idx].qy;
-                    s_qz[tid] = positions[tile_idx].qz;
-                    s_m[tid] = positions[tile_idx].m;
+                    double4 tile = public_data[tile_idx];
+                    s_qx[tid] = tile.x;
+                    s_qy[tid] = tile.y;
+                    s_qz[tid] = tile.z;
+                    s_m[tid] = tile.w;
                 }
                 else
                 {
+                    s_qx[tid] = 0.0;
+                    s_qy[tid] = 0.0;
+                    s_qz[tid] = 0.0;
                     s_m[tid] = 0.0;
                 }
                 __syncthreads();
@@ -608,7 +609,7 @@ struct BatchedGPUContext
 
     int device_id;
     Body *d_initial_state;                // Read-only input buffer
-    Body *d_positions[NUM_STREAMS];       // Working buffers for cooperative kernel
+    double4 *d_public_data[NUM_STREAMS];  // Working buffers for cooperative kernel
     int *d_collision_flags[NUM_STREAMS];  // Collision flags for early exit
     int *d_target_destroyed[NUM_STREAMS]; // Target destroyed flags
     int *d_destroyed_step[NUM_STREAMS];   // Destroyed step storage
@@ -648,7 +649,7 @@ struct BatchedGPUContext
             if (use_cooperative)
             {
                 // Cooperative kernel needs working buffer and flags
-                HIP_CHECK(hipMalloc((void **)&d_positions[i], n * sizeof(Body)));
+                HIP_CHECK(hipMalloc((void **)&d_public_data[i], n * sizeof(double4)));
                 HIP_CHECK(hipMalloc((void **)&d_collision_flags[i], sizeof(int)));
                 HIP_CHECK(hipMalloc((void **)&d_target_destroyed[i], sizeof(int)));
                 HIP_CHECK(hipMalloc((void **)&d_destroyed_step[i], sizeof(int)));
@@ -677,7 +678,7 @@ struct BatchedGPUContext
         {
             // Use multi-block cooperative kernel for large N
             void *args[] = {
-                &d_positions[sid],
+                &d_public_data[sid],
                 &d_initial_state,
                 &n,
                 &planet_id,
@@ -743,7 +744,7 @@ struct BatchedGPUContext
         {
             if (use_cooperative)
             {
-                HIP_CHECK(hipFree(d_positions[i]));
+                HIP_CHECK(hipFree(d_public_data[i]));
                 HIP_CHECK(hipFree(d_collision_flags[i]));
                 HIP_CHECK(hipFree(d_target_destroyed[i]));
                 HIP_CHECK(hipFree(d_destroyed_step[i]));
